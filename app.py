@@ -115,8 +115,32 @@ st.markdown(
     """
     <div class="hero">
       <h1>🎓 Learning Media Toolkit</h1>
-      <p>Two handy tools for your content workflow — extract PowerPoint speaker notes or turn video into audio.</p>
+      <p>Your everyday toolkit for learning media production. Extract, convert and prepare content with simple, practical tools.</p>
     </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin:0 0 1.35rem 0;">
+      <div class="tool-card" style="margin:0;">
+        <div class="tool-icon">📝</div>
+        <div class="tool-title">PPT Notes Extractor</div>
+        <p class="tool-description">Extract speaker notes and export them to Word or TXT.</p>
+      </div>
+      <div class="tool-card" style="margin:0;">
+        <div class="tool-icon" style="background:#fff2ea;">🔊</div>
+        <div class="tool-title">PPT Audio Extractor</div>
+        <p class="tool-description">Collect slide audio in order and merge it into one MP3.</p>
+      </div>
+      <div class="tool-card" style="margin:0;">
+        <div class="tool-icon" style="background:#eaf7f0;">🎧</div>
+        <div class="tool-title">MP4 to MP3 Converter</div>
+        <p class="tool-description">Extract the audio track from an MP4 video.</p>
+      </div>
+    </div>
+    <p class="small-note" style="margin:0 0 1rem 0;">Choose a utility below to get started.</p>
     """,
     unsafe_allow_html=True,
 )
@@ -504,7 +528,7 @@ def create_merged_ppt_audio(uploaded_pptx):
 # Main tools
 # -------------------------------------------------------------------
 ppt_tab, ppt_audio_tab, audio_tab = st.tabs(
-    ["📝  PPT Speaker Notes", "🔊  PPT Audio Merger", "🎧  MP4 to MP3"]
+    ["📝  PPT Notes Extractor", "🔊  PPT Audio Extractor", "🎧  MP4 to MP3"]
 )
 
 with ppt_tab:
@@ -512,7 +536,7 @@ with ppt_tab:
         """
         <div class="tool-card">
           <div class="tool-icon">📝</div>
-          <div class="tool-title">PowerPoint Speaker Notes Extractor</div>
+          <div class="tool-title">PPT Notes Extractor</div>
           <p class="tool-description">Pull speaker notes into a clean text file, with a quick report of slides that may need checking.</p>
         </div>
         """,
@@ -618,7 +642,7 @@ with ppt_audio_tab:
         """
         <div class="tool-card">
           <div class="tool-icon">🔊</div>
-          <div class="tool-title">PowerPoint Audio Extractor & Merger</div>
+          <div class="tool-title">PPT Audio Extractor & Merger</div>
           <p class="tool-description">Extract embedded audio from every slide, arrange clips in slide order, and combine them into one MP3.</p>
         </div>
         """,
@@ -727,6 +751,6 @@ with audio_tab:
 
 st.markdown("---")
 st.markdown(
-    '<p class="small-note" style="text-align:center;">Made for a smoother content workflow · PPT notes, slide audio & video audio tools</p>',
+    '<p class="small-note" style="text-align:center;">Learning Media Toolkit · Practical tools for instructional design and learning media production</p>',
     unsafe_allow_html=True,
 )
