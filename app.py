@@ -403,8 +403,12 @@ def extract_audio_references(pptx_bytes):
 
             slide_clips = []
             seen_rids = set()
-            # Reading attributes in document order preserves the order in which
-            # audio objects are referenced by the slide's XML.
+            seen_media_paths = set()
+            # PowerPoint may expose the same embedded audio through multiple
+            # relationship IDs (for example, an audio object and its media
+            # reference). Deduplicate by the actual package media path within
+            # each slide, while still allowing the same file on another slide.
+            # Reading attributes in document order preserves slide clip order.
             for element in slide_xml.iter():
                 for attr_name, rid in element.attrib.items():
                     if not attr_name.endswith("}embed") and not attr_name.endswith("}link"):
@@ -416,7 +420,13 @@ def extract_audio_references(pptx_bytes):
                     media_path = rel["path"]
                     suffix = Path(media_path).suffix.lower()
                     is_audio = suffix in AUDIO_EXTENSIONS or "/audio" in rel["type"]
-                    if is_audio and rel["mode"] != "External" and media_path in archive_names:
+                    if (
+                        is_audio
+                        and rel["mode"] != "External"
+                        and media_path in archive_names
+                        and media_path not in seen_media_paths
+                    ):
+                        seen_media_paths.add(media_path)
                         slide_clips.append({
                             "slide": slide_number,
                             "relationship_id": rid,
