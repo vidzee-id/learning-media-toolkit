@@ -9,6 +9,8 @@ from pathlib import Path
 import imageio_ffmpeg
 import streamlit as st
 from pptx import Presentation
+from docx import Document
+from docx.shared import Inches, Pt
 
 
 st.set_page_config(
@@ -174,6 +176,7 @@ def extract_ppt_notes(pptx_file):
         "extracted_slides": [],
         "empty_slides": [],
         "failed_slides": [],
+        "slide_notes": {},
     }
 
     pptx_bytes = pptx_file.getvalue()
@@ -237,6 +240,7 @@ def extract_ppt_notes(pptx_file):
                 except Exception:
                     result["failed_slides"].append(slide_number)
 
+            result["slide_notes"] = slide_notes
             output_blocks = [
                 f"SLIDE {number}\n{slide_notes[number]}"
                 for number in range(1, result["total_slides"] + 1)
@@ -252,6 +256,55 @@ def extract_ppt_notes(pptx_file):
         raise ValueError(f"Could not read the PowerPoint file: {exc}") from exc
 
     return result
+
+
+def create_notes_word_document(result, source_filename):
+    """Build a formatted Word document containing extracted notes by slide."""
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    section.left_margin = Inches(0.8)
+    section.right_margin = Inches(0.8)
+
+    title = document.add_heading("PowerPoint Speaker Notes", level=0)
+    title.style.font.name = "Aptos Display"
+    subtitle = document.add_paragraph()
+    subtitle.add_run("Source presentation: ").bold = True
+    subtitle.add_run(source_filename)
+    subtitle.add_run("\nSlides in presentation: ").bold = True
+    subtitle.add_run(str(result["total_slides"]))
+    subtitle.add_run("\nSlides with notes extracted: ").bold = True
+    subtitle.add_run(str(len(result["extracted_slides"])))
+
+    document.add_paragraph(
+        "Review the extracted notes before use. Slides without readable notes may be blank or may contain content that needs manual checking."
+    )
+
+    slide_notes = result.get("slide_notes", {})
+    for slide_number in sorted(slide_notes):
+        document.add_heading(f"Slide {slide_number}", level=1)
+        for paragraph_text in slide_notes[slide_number].splitlines():
+            if paragraph_text.strip():
+                document.add_paragraph(paragraph_text.strip())
+
+    if result.get("empty_slides") or result.get("failed_slides"):
+        document.add_heading("Slides to Review", level=1)
+        if result.get("empty_slides"):
+            document.add_paragraph(
+                "No readable notes found on slide(s): "
+                + ", ".join(map(str, result["empty_slides"]))
+            )
+        if result.get("failed_slides"):
+            document.add_paragraph(
+                "Could not read slide(s): "
+                + ", ".join(map(str, result["failed_slides"]))
+            )
+
+    output = io.BytesIO()
+    document.save(output)
+    output.seek(0)
+    return output.getvalue()
 
 
 # -------------------------------------------------------------------
@@ -300,10 +353,148 @@ def convert_mp4_to_mp3(uploaded_video):
 
 
 # -------------------------------------------------------------------
+# PowerPoint slide audio extraction and merging
+# -------------------------------------------------------------------
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".wma", ".oga", ".ogg", ".opus", ".mid", ".midi"}
+
+
+def _normalise_zip_target(base_folder, target):
+    target = target.replace("\\", "/")
+    if target.startswith("/"):
+        return target.lstrip("/")
+    parts = (base_folder + "/" + target).split("/")
+    cleaned = []
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if cleaned:
+                cleaned.pop()
+        else:
+            cleaned.append(part)
+    return "/".join(cleaned)
+
+
+def extract_audio_references(pptx_bytes):
+    """Return embedded audio media references in presentation slide order."""
+    presentation = Presentation(io.BytesIO(pptx_bytes))
+    found = []
+    slides_without_audio = []
+
+    with zipfile.ZipFile(io.BytesIO(pptx_bytes)) as archive:
+        archive_names = set(archive.namelist())
+        for slide_number, slide in enumerate(presentation.slides, start=1):
+            slide_path = str(slide.part.partname).lstrip("/")
+            slide_xml = ET.fromstring(archive.read(slide_path))
+            rels_path = str(Path(slide_path).parent / "_rels" / (Path(slide_path).name + ".rels"))
+            rel_map = {}
+            if rels_path in archive_names:
+                rel_root = ET.fromstring(archive.read(rels_path))
+                for rel in rel_root:
+                    rid = rel.attrib.get("Id")
+                    target = rel.attrib.get("Target", "")
+                    rel_type = rel.attrib.get("Type", "").lower()
+                    if rid and target:
+                        rel_map[rid] = {
+                            "path": _normalise_zip_target(str(Path(slide_path).parent), target),
+                            "type": rel_type,
+                            "mode": rel.attrib.get("TargetMode", ""),
+                        }
+
+            slide_clips = []
+            seen_rids = set()
+            # Reading attributes in document order preserves the order in which
+            # audio objects are referenced by the slide's XML.
+            for element in slide_xml.iter():
+                for attr_name, rid in element.attrib.items():
+                    if not attr_name.endswith("}embed") and not attr_name.endswith("}link"):
+                        continue
+                    if rid in seen_rids or rid not in rel_map:
+                        continue
+                    seen_rids.add(rid)
+                    rel = rel_map[rid]
+                    media_path = rel["path"]
+                    suffix = Path(media_path).suffix.lower()
+                    is_audio = suffix in AUDIO_EXTENSIONS or "/audio" in rel["type"]
+                    if is_audio and rel["mode"] != "External" and media_path in archive_names:
+                        slide_clips.append({
+                            "slide": slide_number,
+                            "relationship_id": rid,
+                            "media_path": media_path,
+                            "data": archive.read(media_path),
+                        })
+
+            if slide_clips:
+                found.extend(slide_clips)
+            else:
+                slides_without_audio.append(slide_number)
+
+    return found, slides_without_audio, len(presentation.slides)
+
+
+def create_merged_ppt_audio(uploaded_pptx):
+    """Extract slide audio, normalize clips, merge in slide order, and return MP3."""
+    pptx_bytes = uploaded_pptx.getvalue()
+    clips, slides_without_audio, total_slides = extract_audio_references(pptx_bytes)
+    if not clips:
+        raise ValueError(
+            "No embedded audio clips were found. Check that audio is inserted into the slides, "
+            "rather than linked from an external file."
+        )
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        wav_paths = []
+        clip_report = []
+
+        for index, clip in enumerate(clips, start=1):
+            suffix = Path(clip["media_path"]).suffix.lower() or ".bin"
+            input_path = temp_path / f"clip_{index:04d}{suffix}"
+            wav_path = temp_path / f"clip_{index:04d}.wav"
+            input_path.write_bytes(clip["data"])
+
+            command = [
+                ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(input_path), "-vn", "-ac", "2", "-ar", "44100",
+                "-c:a", "pcm_s16le", str(wav_path),
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=600)
+            if completed.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size == 0:
+                detail = (completed.stderr or "FFmpeg could not read this audio clip.").strip()
+                raise ValueError(f"Could not process audio on slide {clip['slide']} ({clip['media_path']}): {detail[-900:]}")
+
+            wav_paths.append(wav_path)
+            clip_report.append({
+                "Slide": clip["slide"],
+                "Clip": index,
+                "Embedded file": Path(clip["media_path"]).name,
+            })
+
+        concat_file = temp_path / "audio_list.txt"
+        concat_file.write_text(
+            "".join(f"file '{path}'\n" for path in wav_paths),
+            encoding="utf-8",
+        )
+        output_path = temp_path / "merged_audio.mp3"
+        merge_command = [
+            ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-c:a", "libmp3lame", "-q:a", "2", str(output_path),
+        ]
+        completed = subprocess.run(merge_command, capture_output=True, text=True, timeout=900)
+        if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+            detail = (completed.stderr or "FFmpeg could not merge the slide audio.").strip()
+            raise ValueError(detail[-1500:])
+
+        return output_path.read_bytes(), clip_report, slides_without_audio, total_slides
+
+
+# -------------------------------------------------------------------
 # Main tools
 # -------------------------------------------------------------------
-ppt_tab, audio_tab = st.tabs(
-    ["📝  PPT Speaker Notes", "🎧  MP4 to MP3"]
+ppt_tab, ppt_audio_tab, audio_tab = st.tabs(
+    ["📝  PPT Speaker Notes", "🔊  PPT Audio Merger", "🎧  MP4 to MP3"]
 )
 
 with ppt_tab:
@@ -367,13 +558,30 @@ with ppt_tab:
                         label_visibility="collapsed",
                     )
                     safe_name = Path(uploaded_pptx.name).stem
-                    st.download_button(
-                        "⬇️ Download notes as TXT",
-                        data=result["notes_text"].encode("utf-8"),
-                        file_name=f"{safe_name}_speaker_notes.txt",
-                        mime="text/plain",
-                        type="primary",
-                    )
+                    download_col1, download_col2 = st.columns(2)
+                    with download_col1:
+                        st.download_button(
+                            "⬇️ Download notes as TXT",
+                            data=result["notes_text"].encode("utf-8"),
+                            file_name=f"{safe_name}_speaker_notes.txt",
+                            mime="text/plain",
+                            type="primary",
+                        )
+                    with download_col2:
+                        try:
+                            word_bytes = create_notes_word_document(
+                                result, uploaded_pptx.name
+                            )
+                            st.download_button(
+                                "📝 Export to Word (.docx)",
+                                data=word_bytes,
+                                file_name=f"{safe_name}_speaker_notes.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            )
+                        except Exception as exc:
+                            st.error("Could not create the Word document.")
+                            with st.expander("Show Word export details"):
+                                st.code(str(exc))
                 else:
                     st.info(
                         "No readable speaker notes were found. Please check the "
@@ -391,6 +599,68 @@ with ppt_tab:
     else:
         st.markdown(
             '<p class="small-note">💡 Tip: speaker notes are different from the text visible on the slides.</p>',
+            unsafe_allow_html=True,
+        )
+
+
+with ppt_audio_tab:
+    st.markdown(
+        """
+        <div class="tool-card">
+          <div class="tool-icon">🔊</div>
+          <div class="tool-title">PowerPoint Audio Extractor & Merger</div>
+          <p class="tool-description">Extract embedded audio from every slide, arrange clips in slide order, and combine them into one MP3.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    uploaded_audio_pptx = st.file_uploader(
+        "Choose a PowerPoint file",
+        type=["pptx"],
+        help="Upload a .pptx presentation containing audio clips embedded in its slides.",
+        key="ppt_audio_upload",
+    )
+
+    if uploaded_audio_pptx is not None:
+        st.caption(f"📄 Selected file: {uploaded_audio_pptx.name} · {uploaded_audio_pptx.size / (1024 * 1024):.1f} MB")
+        st.info("Audio clips are combined in slide order. If a slide contains multiple audio objects, their order in the slide's audio references is used. External linked audio files cannot be retrieved.")
+
+        if st.button("✨ Extract and merge slide audio", key="merge_ppt_audio_button", type="primary"):
+            try:
+                with st.spinner("Finding slide audio, converting clips and creating your MP3…"):
+                    mp3_bytes, clip_report, slides_without_audio, total_slides = create_merged_ppt_audio(uploaded_audio_pptx)
+
+                st.success("Your PowerPoint audio has been merged successfully!")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("📑 Total slides", total_slides)
+                col2.metric("🔊 Audio clips", len(clip_report))
+                col3.metric("🔎 Slides without audio", len(slides_without_audio))
+
+                if slides_without_audio:
+                    st.warning("No embedded audio was found on slide(s): " + ", ".join(map(str, slides_without_audio)))
+
+                with st.expander("View extracted audio clip list"):
+                    st.dataframe(clip_report, use_container_width=True, hide_index=True)
+
+                safe_name = Path(uploaded_audio_pptx.name).stem
+                st.audio(mp3_bytes, format="audio/mpeg")
+                st.download_button(
+                    "⬇️ Download complete audio as MP3",
+                    data=mp3_bytes,
+                    file_name=f"{safe_name}_complete_audio.mp3",
+                    mime="audio/mpeg",
+                    type="primary",
+                )
+            except subprocess.TimeoutExpired:
+                st.error("Audio processing took too long. Try a smaller presentation or fewer/lower-size audio clips.")
+            except Exception as exc:
+                st.error("We couldn't extract or merge the slide audio.")
+                with st.expander("Show technical details"):
+                    st.code(str(exc))
+    else:
+        st.markdown(
+            '<p class="small-note">💡 Tip: use a .pptx file with audio inserted into the slides. Audio linked from an external location will not be included.</p>',
             unsafe_allow_html=True,
         )
 
@@ -447,6 +717,6 @@ with audio_tab:
 
 st.markdown("---")
 st.markdown(
-    '<p class="small-note" style="text-align:center;">Made for a smoother content workflow · PPT notes & audio tools</p>',
+    '<p class="small-note" style="text-align:center;">Made for a smoother content workflow · PPT notes, slide audio & video audio tools</p>',
     unsafe_allow_html=True,
 )
