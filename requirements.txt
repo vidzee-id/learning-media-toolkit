@@ -2,3 +2,4 @@ streamlit
 python-pptx
 moviepy
 imageio-ffmpeg
+python-docx
