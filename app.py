@@ -524,6 +524,44 @@ def create_merged_ppt_audio(uploaded_pptx):
         return output_path.read_bytes(), clip_report, slides_without_audio, total_slides
 
 
+def clean_merged_audio(mp3_bytes, remove_long_pauses=True, reduce_noise=True, normalize_volume=True, pause_seconds=2.0):
+    """Apply free FFmpeg-based cleanup to an already merged MP3.
+
+    This deliberately does not attempt transcript-based slide-announcement or
+    retake removal; those require speech recognition and are planned for a later phase.
+    """
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        input_path = temp_path / "original.mp3"
+        output_path = temp_path / "cleaned.mp3"
+        input_path.write_bytes(mp3_bytes)
+
+        filters = []
+        if remove_long_pauses:
+            # Keep a short natural gap after each detected silence rather than
+            # hard-cutting speech. The threshold is intentionally conservative.
+            filters.append(
+                f"silenceremove=start_periods=0:stop_periods=-1:"
+                f"stop_duration={float(pause_seconds):.2f}:"
+                "stop_threshold=-42dB:stop_silence=0.45:detection=rms"
+            )
+        if reduce_noise:
+            filters.append("afftdn=nf=-25:tn=1")
+        if normalize_volume:
+            filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+
+        command = [ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y", "-i", str(input_path)]
+        if filters:
+            command += ["-af", ",".join(filters)]
+        command += ["-c:a", "libmp3lame", "-q:a", "2", str(output_path)]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=900)
+        if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+            detail = (completed.stderr or "FFmpeg could not clean the merged audio.").strip()
+            raise ValueError(detail[-1500:])
+        return output_path.read_bytes()
+
+
 # -------------------------------------------------------------------
 # Main tools
 # -------------------------------------------------------------------
@@ -660,12 +698,26 @@ with ppt_audio_tab:
         st.caption(f"📄 Selected file: {uploaded_audio_pptx.name} · {uploaded_audio_pptx.size / (1024 * 1024):.1f} MB")
         st.info("Audio clips are combined in slide order. If a slide contains multiple audio objects, their order in the slide's audio references is used. External linked audio files cannot be retrieved.")
 
-        if st.button("✨ Extract and merge slide audio", key="merge_ppt_audio_button", type="primary"):
-            try:
-                with st.spinner("Finding slide audio, converting clips and creating your MP3…"):
-                    mp3_bytes, clip_report, slides_without_audio, total_slides = create_merged_ppt_audio(uploaded_audio_pptx)
+        st.markdown("#### 🧹 Optional audio cleanup (free)" )
+        clean_pauses = st.checkbox("Shorten long pauses", value=True, help="Keeps a short natural gap after detected silence; it does not remove ordinary pauses.")
+        pause_seconds = st.slider("Treat silence longer than (seconds)", min_value=1.0, max_value=5.0, value=2.0, step=0.5, disabled=not clean_pauses)
+        reduce_noise = st.checkbox("Reduce steady background noise", value=True, help="Reduces constant fan or hum noise. Results depend on the recording.")
+        normalize_volume = st.checkbox("Normalize volume", value=True, help="Balances overall loudness and helps prevent sudden volume differences.")
+        st.caption("This first version uses FFmpeg locally on the uploaded audio. Automatic removal of spoken slide numbers and retakes will be added in the later AI phase.")
 
-                st.success("Your PowerPoint audio has been merged successfully!")
+        if st.button("✨ Extract, merge and clean audio", key="merge_ppt_audio_button", type="primary"):
+            try:
+                with st.spinner("Finding slide audio, merging clips and applying cleanup…"):
+                    original_mp3, clip_report, slides_without_audio, total_slides = create_merged_ppt_audio(uploaded_audio_pptx)
+                    cleaned_mp3 = clean_merged_audio(
+                        original_mp3,
+                        remove_long_pauses=clean_pauses,
+                        reduce_noise=reduce_noise,
+                        normalize_volume=normalize_volume,
+                        pause_seconds=pause_seconds,
+                    )
+
+                st.success("Your slide audio has been merged. The cleaned version is ready!")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("📑 Total slides", total_slides)
                 col2.metric("🔊 Audio clips", len(clip_report))
@@ -678,14 +730,28 @@ with ppt_audio_tab:
                     st.dataframe(clip_report, use_container_width=True, hide_index=True)
 
                 safe_name = Path(uploaded_audio_pptx.name).stem
-                st.audio(mp3_bytes, format="audio/mpeg")
-                st.download_button(
-                    "⬇️ Download complete audio as MP3",
-                    data=mp3_bytes,
-                    file_name=f"{safe_name}_complete_audio.mp3",
-                    mime="audio/mpeg",
-                    type="primary",
-                )
+                original_col, cleaned_col = st.columns(2)
+                with original_col:
+                    st.markdown("**Original merged audio**")
+                    st.audio(original_mp3, format="audio/mpeg")
+                    st.download_button(
+                        "⬇️ Download original MP3",
+                        data=original_mp3,
+                        file_name=f"{safe_name}_original_audio.mp3",
+                        mime="audio/mpeg",
+                        key="download_original_ppt_audio",
+                    )
+                with cleaned_col:
+                    st.markdown("**Cleaned audio**")
+                    st.audio(cleaned_mp3, format="audio/mpeg")
+                    st.download_button(
+                        "⬇️ Download cleaned MP3",
+                        data=cleaned_mp3,
+                        file_name=f"{safe_name}_cleaned_audio.mp3",
+                        mime="audio/mpeg",
+                        type="primary",
+                        key="download_cleaned_ppt_audio",
+                    )
             except subprocess.TimeoutExpired:
                 st.error("Audio processing took too long. Try a smaller presentation or fewer/lower-size audio clips.")
             except Exception as exc:
